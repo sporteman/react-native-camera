@@ -23,11 +23,17 @@ import java.util.List;
 import java.util.EnumMap;
 import java.util.EnumSet;
 
-import me.dm7.barcodescanner.zbar.BarcodeFormat;
-import me.dm7.barcodescanner.zbar.Result;
-
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.MultiFormatReader;
+import com.google.zxing.PlanarYUVLuminanceSource;
+import com.google.zxing.Result;
+import com.google.zxing.common.HybridBinarizer;
 
 class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceTextureListener, Camera.PreviewCallback {
+
+    final Handler handler = new Handler();
     private int _cameraType;
     private int _captureMode;
     private SurfaceTexture _surfaceTexture;
@@ -41,6 +47,8 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
     // concurrency lock for barcode scanner to avoid flooding the runtime
     public static volatile boolean barcodeScannerTaskLock = false;
 
+    // reader instance for the barcode scanner
+    private final MultiFormatReader _multiFormatReader = new MultiFormatReader();
 
     public RCTCameraViewFinder(Context context, int type) {
         super(context);
@@ -125,9 +133,6 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
         }
     }
 
-    final Handler handler = new Handler();
-
-
     synchronized private void startCamera() {
         if (!_isStarting) {
             _isStarting = true;
@@ -135,58 +140,57 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
             handler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    try {
+            try {
+                _camera = RCTCamera.getInstance().acquireCameraInstance(_cameraType);
+                Camera.Parameters parameters = _camera.getParameters();
 
-                        _camera = RCTCamera.getInstance().acquireCameraInstance(_cameraType);
-                        Camera.Parameters parameters = _camera.getParameters();
+                final boolean isCaptureModeStill = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_STILL);
+                final boolean isCaptureModeVideo = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_VIDEO);
+                if (!isCaptureModeStill && !isCaptureModeVideo) {
+                    throw new RuntimeException("Unsupported capture mode:" + _captureMode);
+                }
 
-                        final boolean isCaptureModeStill = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_STILL);
-                        final boolean isCaptureModeVideo = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_VIDEO);
-                        if (!isCaptureModeStill && !isCaptureModeVideo) {
-                            throw new RuntimeException("Unsupported capture mode:" + _captureMode);
-                        }
+                // Set auto-focus. Try to set to continuous picture/video, and fall back to general
+                // auto if available.
+                List<String> focusModes = parameters.getSupportedFocusModes();
+                if (isCaptureModeStill && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+                    parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                } else if (isCaptureModeVideo && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
+                    parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                    parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                }
 
-                        // Set auto-focus. Try to set to continuous picture/video, and fall back to general
-                        // auto if available.
-                        List<String> focusModes = parameters.getSupportedFocusModes();
-                        if (isCaptureModeStill && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                            parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
-                        } else if (isCaptureModeVideo && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
-                            parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
-                        } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
-                            parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
-                        }
+                // set picture size
+                // defaults to max available size
+                List<Camera.Size> supportedSizes;
+                if (isCaptureModeStill) {
+                    supportedSizes = parameters.getSupportedPictureSizes();
+                } else if (isCaptureModeVideo) {
+                    supportedSizes = RCTCamera.getInstance().getSupportedVideoSizes(_camera);
+                } else {
+                    throw new RuntimeException("Unsupported capture mode:" + _captureMode);
+                }
+                Camera.Size optimalPictureSize = RCTCamera.getInstance().getBestSize(
+                        supportedSizes,
+                        Integer.MAX_VALUE,
+                        Integer.MAX_VALUE
+                );
+                parameters.setPictureSize(optimalPictureSize.width, optimalPictureSize.height);
 
-                        // set picture size
-                        // defaults to max available size
-                        List<Camera.Size> supportedSizes;
-                        if (isCaptureModeStill) {
-                            supportedSizes = parameters.getSupportedPictureSizes();
-                        } else if (isCaptureModeVideo) {
-                            supportedSizes = RCTCamera.getInstance().getSupportedVideoSizes(_camera);
-                        } else {
-                            throw new RuntimeException("Unsupported capture mode:" + _captureMode);
-                        }
-                        Camera.Size optimalPictureSize = RCTCamera.getInstance().getBestSize(
-                                supportedSizes,
-                                Integer.MAX_VALUE,
-                                Integer.MAX_VALUE
-                        );
-                        parameters.setPictureSize(optimalPictureSize.width, optimalPictureSize.height);
-
-                        _camera.setParameters(parameters);
-                        _camera.setPreviewTexture(_surfaceTexture);
-                        _camera.startPreview();
-                        // send previews to `onPreviewFrame`
-                        _camera.setPreviewCallback(ref);
-                    } catch (NullPointerException e) {
-                        e.printStackTrace();
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                        stopCamera();
-                    } finally {
-                        _isStarting = false;
-                    }
+                _camera.setParameters(parameters);
+                _camera.setPreviewTexture(_surfaceTexture);
+                _camera.startPreview();
+                // send previews to `onPreviewFrame`
+                _camera.setPreviewCallback(this);
+            } catch (NullPointerException e) {
+                e.printStackTrace();
+            } catch (Exception e) {
+                e.printStackTrace();
+                stopCamera();
+            } finally {
+                _isStarting = false;
+            }
                 }
             }, 100);
         }
@@ -214,45 +218,46 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
 
     /**
      * Parse barcodes as BarcodeFormat constants.
-     * <p>
+     *
      * Supports all iOS codes except [code39mod43, itf14]
-     * <p>
+     *
      * Additionally supports [codabar, maxicode, rss14, rssexpanded, upca, upceanextension]
      */
     private BarcodeFormat parseBarCodeString(String c) {
-
-        if ("PARTIAL".equalsIgnoreCase(c)) {
-            return BarcodeFormat.PARTIAL;
-        } else if ("EAN8".equalsIgnoreCase(c)) {
-            return BarcodeFormat.EAN8;
-        } else if ("UPCE".equalsIgnoreCase(c)) {
-            return BarcodeFormat.UPCE;
-        } else if ("ISBN10".equalsIgnoreCase(c)) {
-            return BarcodeFormat.ISBN10;
-        } else if ("UPCA".equalsIgnoreCase(c)) {
-            return BarcodeFormat.UPCA;
-        } else if ("EAN13".equalsIgnoreCase(c)) {
-            return BarcodeFormat.EAN13;
-        } else if ("ISBN13".equalsIgnoreCase(c)) {
-            return BarcodeFormat.ISBN13;
-        } else if ("I25".equalsIgnoreCase(c)) {
-            return BarcodeFormat.I25;
-        } else if ("DATABAR".equalsIgnoreCase(c)) {
-            return BarcodeFormat.DATABAR;
-        } else if ("DATABAR_EXP".equalsIgnoreCase(c)) {
-            return BarcodeFormat.DATABAR_EXP;
-        } else if ("codabar".equalsIgnoreCase(c)) {
+        if ("aztec".equals(c)) {
+            return BarcodeFormat.AZTEC;
+        } else if ("ean13".equals(c)) {
+            return BarcodeFormat.EAN_13;
+        } else if ("ean8".equals(c)) {
+            return BarcodeFormat.EAN_8;
+        } else if ("qr".equals(c)) {
+            return BarcodeFormat.QR_CODE;
+        } else if ("pdf417".equals(c)) {
+            return BarcodeFormat.PDF_417;
+        } else if ("upce".equals(c)) {
+            return BarcodeFormat.UPC_E;
+        } else if ("datamatrix".equals(c)) {
+            return BarcodeFormat.DATA_MATRIX;
+        } else if ("code39".equals(c)) {
+            return BarcodeFormat.CODE_39;
+        } else if ("code93".equals(c)) {
+            return BarcodeFormat.CODE_93;
+        } else if ("interleaved2of5".equals(c)) {
+            return BarcodeFormat.ITF;
+        } else if ("codabar".equals(c)) {
             return BarcodeFormat.CODABAR;
-        } else if ("CODE39".equalsIgnoreCase(c)) {
-            return BarcodeFormat.CODE39;
-        } else if ("PDF417".equalsIgnoreCase(c)) {
-            return BarcodeFormat.PDF417;
-        } else if ("QRCODE".equalsIgnoreCase(c)) {
-            return BarcodeFormat.QRCODE;
-        } else if ("CODE93".equalsIgnoreCase(c)) {
-            return BarcodeFormat.CODE93;
-        } else if ("CODE128".equalsIgnoreCase(c)) {
-            return BarcodeFormat.CODE128;
+        } else if ("code128".equals(c)) {
+            return BarcodeFormat.CODE_128;
+        } else if ("maxicode".equals(c)) {
+            return BarcodeFormat.MAXICODE;
+        } else if ("rss14".equals(c)) {
+            return BarcodeFormat.RSS_14;
+        } else if ("rssexpanded".equals(c)) {
+            return BarcodeFormat.RSS_EXPANDED;
+        } else if ("upca".equals(c)) {
+            return BarcodeFormat.UPC_A;
+        } else if ("upceanextension".equals(c)) {
+            return BarcodeFormat.UPC_EAN_EXTENSION;
         } else {
             android.util.Log.v("RCTCamera", "Unsupported code.. [" + c + "]");
             return null;
@@ -263,7 +268,7 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
      * Initialize the barcode decoder.
      */
     private void initBarcodeReader(List<String> barCodeTypes) {
-/*        EnumMap<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        EnumMap<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
         EnumSet<BarcodeFormat> decodeFormats = EnumSet.noneOf(BarcodeFormat.class);
 
         if (barCodeTypes != null) {
@@ -276,14 +281,14 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
         }
 
         hints.put(DecodeHintType.POSSIBLE_FORMATS, decodeFormats);
-        _multiFormatReader.setHints(hints);*/
+        _multiFormatReader.setHints(hints);
     }
 
     /**
      * Spawn a barcode reader task if
-     * - the barcode scanner is enabled (has a onBarCodeRead function)
-     * - one isn't already running
-     * <p>
+     *  - the barcode scanner is enabled (has a onBarCodeRead function)
+     *  - one isn't already running
+     *
      * See {Camera.PreviewCallback}
      */
     public void onPreviewFrame(byte[] data, Camera camera) {
@@ -327,7 +332,7 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
             }
 
             try {
-                /*PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(imageData, width, height, 0, 0, width, height, false);
+                PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(imageData, width, height, 0, 0, width, height, false);
                 BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
                 Result result = _multiFormatReader.decodeWithState(bitmap);
 
@@ -336,11 +341,11 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
                 event.putString("data", result.getText());
                 event.putString("type", result.getBarcodeFormat().toString());
                 reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit("CameraBarCodeReadAndroid", event);
-*/
+
             } catch (Throwable t) {
                 // meh
             } finally {
-                //_multiFormatReader.reset();
+                _multiFormatReader.reset();
                 RCTCameraViewFinder.barcodeScannerTaskLock = false;
                 return null;
             }
@@ -391,7 +396,7 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
 
     /**
      * Handles setting focus to the location of the event.
-     * <p>
+     *
      * Note that this will override the focus mode on the camera to FOCUS_MODE_AUTO if available,
      * even if this was previously something else (such as FOCUS_MODE_CONTINUOUS_*; see also
      * {@link #startCamera()}. However, this makes sense - after the user has initiated any
@@ -451,9 +456,7 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
         }
     }
 
-    /**
-     * Determine the space between the first two fingers
-     */
+    /** Determine the space between the first two fingers */
     private float getFingerSpacing(MotionEvent event) {
         float x = event.getX(0) - event.getX(1);
         float y = event.getY(0) - event.getY(1);

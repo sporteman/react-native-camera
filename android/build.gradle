@@ -32,6 +32,6 @@ repositories {
 
 dependencies {
   compile "com.facebook.react:react-native:0.19.+"
-  compile 'me.dm7.barcodescanner:zbar:1.9'
+  compile "com.google.zxing:core:3.3.0"
   compile "com.drewnoakes:metadata-extractor:2.9.1"
 }
