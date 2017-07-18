@@ -8,6 +8,7 @@ import android.content.Context;
 import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
+import android.os.Handler;
 import android.view.MotionEvent;
 import android.view.TextureView;
 import android.os.AsyncTask;
@@ -124,60 +125,70 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
         }
     }
 
+    final Handler handler = new Handler();
+
+
     synchronized private void startCamera() {
         if (!_isStarting) {
             _isStarting = true;
-            try {
-                _camera = RCTCamera.getInstance().acquireCameraInstance(_cameraType);
-                Camera.Parameters parameters = _camera.getParameters();
+            final RCTCameraViewFinder ref = this;
+            handler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
 
-                final boolean isCaptureModeStill = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_STILL);
-                final boolean isCaptureModeVideo = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_VIDEO);
-                if (!isCaptureModeStill && !isCaptureModeVideo) {
-                    throw new RuntimeException("Unsupported capture mode:" + _captureMode);
+                        _camera = RCTCamera.getInstance().acquireCameraInstance(_cameraType);
+                        Camera.Parameters parameters = _camera.getParameters();
+
+                        final boolean isCaptureModeStill = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_STILL);
+                        final boolean isCaptureModeVideo = (_captureMode == RCTCameraModule.RCT_CAMERA_CAPTURE_MODE_VIDEO);
+                        if (!isCaptureModeStill && !isCaptureModeVideo) {
+                            throw new RuntimeException("Unsupported capture mode:" + _captureMode);
+                        }
+
+                        // Set auto-focus. Try to set to continuous picture/video, and fall back to general
+                        // auto if available.
+                        List<String> focusModes = parameters.getSupportedFocusModes();
+                        if (isCaptureModeStill && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+                            parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                        } else if (isCaptureModeVideo && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
+                            parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+                        } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                            parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                        }
+
+                        // set picture size
+                        // defaults to max available size
+                        List<Camera.Size> supportedSizes;
+                        if (isCaptureModeStill) {
+                            supportedSizes = parameters.getSupportedPictureSizes();
+                        } else if (isCaptureModeVideo) {
+                            supportedSizes = RCTCamera.getInstance().getSupportedVideoSizes(_camera);
+                        } else {
+                            throw new RuntimeException("Unsupported capture mode:" + _captureMode);
+                        }
+                        Camera.Size optimalPictureSize = RCTCamera.getInstance().getBestSize(
+                                supportedSizes,
+                                Integer.MAX_VALUE,
+                                Integer.MAX_VALUE
+                        );
+                        parameters.setPictureSize(optimalPictureSize.width, optimalPictureSize.height);
+
+                        _camera.setParameters(parameters);
+                        _camera.setPreviewTexture(_surfaceTexture);
+                        _camera.startPreview();
+                        // send previews to `onPreviewFrame`
+                        _camera.setPreviewCallback(ref);
+                    } catch (NullPointerException e) {
+                        e.printStackTrace();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        stopCamera();
+                    } finally {
+                        _isStarting = false;
+                    }
                 }
-
-                // Set auto-focus. Try to set to continuous picture/video, and fall back to general
-                // auto if available.
-                List<String> focusModes = parameters.getSupportedFocusModes();
-                if (isCaptureModeStill && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                    parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
-                } else if (isCaptureModeVideo && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
-                    parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
-                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
-                    parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
-                }
-
-                // set picture size
-                // defaults to max available size
-                List<Camera.Size> supportedSizes;
-                if (isCaptureModeStill) {
-                    supportedSizes = parameters.getSupportedPictureSizes();
-                } else if (isCaptureModeVideo) {
-                    supportedSizes = RCTCamera.getInstance().getSupportedVideoSizes(_camera);
-                } else {
-                    throw new RuntimeException("Unsupported capture mode:" + _captureMode);
-                }
-                Camera.Size optimalPictureSize = RCTCamera.getInstance().getBestSize(
-                        supportedSizes,
-                        Integer.MAX_VALUE,
-                        Integer.MAX_VALUE
-                );
-                parameters.setPictureSize(optimalPictureSize.width, optimalPictureSize.height);
-
-                _camera.setParameters(parameters);
-                _camera.setPreviewTexture(_surfaceTexture);
-                _camera.startPreview();
-                // send previews to `onPreviewFrame`
-                _camera.setPreviewCallback(this);
-            } catch (NullPointerException e) {
-                e.printStackTrace();
-            } catch (Exception e) {
-                e.printStackTrace();
-                stopCamera();
-            } finally {
-                _isStarting = false;
-            }
+            }, 100);
         }
     }
 
@@ -203,9 +214,9 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
 
     /**
      * Parse barcodes as BarcodeFormat constants.
-     *
+     * <p>
      * Supports all iOS codes except [code39mod43, itf14]
-     *
+     * <p>
      * Additionally supports [codabar, maxicode, rss14, rssexpanded, upca, upceanextension]
      */
     private BarcodeFormat parseBarCodeString(String c) {
@@ -270,9 +281,9 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
 
     /**
      * Spawn a barcode reader task if
-     *  - the barcode scanner is enabled (has a onBarCodeRead function)
-     *  - one isn't already running
-     *
+     * - the barcode scanner is enabled (has a onBarCodeRead function)
+     * - one isn't already running
+     * <p>
      * See {Camera.PreviewCallback}
      */
     public void onPreviewFrame(byte[] data, Camera camera) {
@@ -380,7 +391,7 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
 
     /**
      * Handles setting focus to the location of the event.
-     *
+     * <p>
      * Note that this will override the focus mode on the camera to FOCUS_MODE_AUTO if available,
      * even if this was previously something else (such as FOCUS_MODE_CONTINUOUS_*; see also
      * {@link #startCamera()}. However, this makes sense - after the user has initiated any
@@ -440,7 +451,9 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
         }
     }
 
-    /** Determine the space between the first two fingers */
+    /**
+     * Determine the space between the first two fingers
+     */
     private float getFingerSpacing(MotionEvent event) {
         float x = event.getX(0) - event.getX(1);
         float y = event.getY(0) - event.getY(1);
